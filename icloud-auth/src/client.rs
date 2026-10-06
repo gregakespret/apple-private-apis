@@ -196,15 +196,22 @@ pub struct AuthenticationExtras {
     pub new_state: Option<LoginState>,
 }
 
-/// The trusted phone to send the SMS code to: the account's first, as `get_auth_extras` itself picks
-/// when Apple has already sent one. Falls back to id 1, the old hardcoded value, only when the lookup
-/// fails, so accounts that sign in today keep doing so.
-fn sms_phone_id(extras: Result<&AuthenticationExtras, &Error>) -> u32 {
-    if let Ok(Some(phone)) = extras.map(|e| e.trusted_phone_numbers.first()) {
-        return phone.id;
+/// The trusted phone to send the SMS code to. Id 1 whenever the account has it, the old hardcoded
+/// value, so accounts that sign in today keep getting the code where they always have; otherwise the
+/// account's first number. A failed lookup also falls back to 1. An account with no trusted phone at
+/// all (security keys only) is an error: no SMS can succeed, and `HardwareKeyError` says why.
+fn sms_phone_id(extras: Result<&AuthenticationExtras, &Error>) -> Result<u32, Error> {
+    match extras {
+        Ok(extras) => {
+            let phones = &extras.trusted_phone_numbers;
+            phones.iter().find(|p| p.id == 1).or(phones.first()).map(|p| p.id).ok_or(Error::HardwareKeyError)
+        }
+        Err(Error::HardwareKeyError) => Err(Error::HardwareKeyError),
+        Err(e) => {
+            warn!("Could not read a trusted phone number ({:?}); sending SMS to phone id 1", e);
+            Ok(1)
+        }
     }
-    warn!("Could not read a trusted phone number ({:?}); sending SMS to phone id 1", extras.err());
-    1
 }
 
 #[cfg(test)]
@@ -222,18 +229,28 @@ mod sms_phone_id_tests {
     // Apple refused, and the user was told to wait and retry forever.
     #[test]
     fn uses_the_accounts_own_phone_id() {
-        assert_eq!(sms_phone_id(Ok(&extras_with_ids(&[3]))), 3);
+        assert_eq!(sms_phone_id(Ok(&extras_with_ids(&[3, 2]))).unwrap(), 3);
     }
 
+    // Accounts that have id 1 signed in fine before; moving their code to another number could
+    // send it somewhere the user no longer has.
     #[test]
-    fn picks_the_first_of_several() {
-        assert_eq!(sms_phone_id(Ok(&extras_with_ids(&[2, 1]))), 2);
+    fn keeps_id_one_when_the_account_has_it() {
+        assert_eq!(sms_phone_id(Ok(&extras_with_ids(&[2, 1]))).unwrap(), 1);
     }
 
     // A failed lookup must not make things worse than the old hardcoded 1, which works for most accounts.
     #[test]
     fn falls_back_to_one_when_lookup_fails() {
-        assert_eq!(sms_phone_id(Err(&Error::FailedGetting2FAConfig)), 1);
+        assert_eq!(sms_phone_id(Err(&Error::FailedGetting2FAConfig)).unwrap(), 1);
+    }
+
+    // With no trusted phone an SMS cannot succeed; sending to id 1 would turn a specific account
+    // error into a generic AuthSrp, the "retry forever" message.
+    #[test]
+    fn no_trusted_phone_is_an_error_not_a_send() {
+        assert!(matches!(sms_phone_id(Err(&Error::HardwareKeyError)), Err(Error::HardwareKeyError)));
+        assert!(matches!(sms_phone_id(Ok(&extras_with_ids(&[]))), Err(Error::HardwareKeyError)));
     }
 }
 
@@ -347,9 +364,12 @@ impl<T: AnisetteProvider> AppleAccount<T> {
                     _self.send_2fa_to_devices().await?;
                     // Phone ids are per account, not a fixed 1: an account whose trusted number was
                     // replaced has only higher ids, and Apple rejects the send for every attempt.
-                    let extras = _self.get_auth_extras().await;
-                    let phone_id = sms_phone_id(extras.as_ref());
-                    response = _self.send_sms_2fa_to_devices(phone_id).await?
+                    response = match _self.get_auth_extras().await {
+                        // A 201 from GET /auth means Apple already sent the code; a second send
+                        // would invalidate the first code or trip Apple's send limit.
+                        Ok(AuthenticationExtras { new_state: Some(state), .. }) => state,
+                        extras => _self.send_sms_2fa_to_devices(sms_phone_id(extras.as_ref())?).await?,
+                    }
                 }
                 LoginState::NeedsSMS2FAVerification(body) => {
                     response = _self.verify_sms_2fa(tfa_closure(), body).await?
@@ -920,7 +940,7 @@ impl<T: AnisetteProvider> AppleAccount<T> {
             return Err(Error::FailedGetting2FAConfig);
         }
         let resp = req.bytes().await?;
-        info!("Got gsa auth extras {:?}", str::from_utf8(&resp).unwrap());
+        info!("Got gsa auth extras {:?}", String::from_utf8_lossy(&resp));
         let mut new_state: AuthenticationExtras = serde_json::from_slice(&resp)?;
         if new_state.trusted_phone_numbers.is_empty() {
             return Err(Error::HardwareKeyError);
