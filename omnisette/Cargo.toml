@@ -38,5 +38,5 @@ objc = "0.2"
 objc-foundation = "0.1"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "macros"] }
+tokio = { version = "1", features = ["rt", "macros", "net", "io-util"] }
 simplelog = "0.12"

@@ -351,7 +351,7 @@ impl AnisetteProvider for ClearADIClient {
                     self.provision(&mut state).await?;
                     plist::to_file_xml(config_path, &mut state)?;
                     self.get_headers(&state).await?
-                } else { panic!() }
+                } else { return Err(err) }
             },
         };
         Ok(data.get_headers())

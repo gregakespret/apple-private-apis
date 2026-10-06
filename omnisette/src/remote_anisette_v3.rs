@@ -237,7 +237,7 @@ impl AnisetteClient {
                 if message.contains("-45061") {
                     Err(AnisetteError::AnisetteNotProvisioned)
                 } else {
-                    panic!("Unknown error {}", message)
+                    Err(AnisetteError::ServerError(message))
                 }
             },
             AnisetteHeaders::Headers { machine_id, one_time_password, routing_info } => {
@@ -414,7 +414,7 @@ impl AnisetteProvider for RemoteAnisetteProviderV3 {
                     client.provision(state).await?;
                     plist::to_file_xml(config_path, state)?;
                     client.get_headers(&state).await?
-                } else { panic!() }
+                } else { return Err(err) }
             },
         };
         Ok(data.get_headers())
@@ -423,3 +423,69 @@ impl AnisetteProvider for RemoteAnisetteProviderV3 {
 
 
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Serves one HTTP response with `body`, then closes.
+    async fn one_shot_server(body: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 8192];
+            let _ = socket.read(&mut request).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(), body,
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        url
+    }
+
+    fn provisioned_state() -> AnisetteState {
+        AnisetteState { adi_pb: Some(vec![1, 2, 3]), ..AnisetteState::default() }
+    }
+
+    // A panic here takes down the caller's whole task, and the server's message
+    // dies with it: the only thing left to report is "failed unexpectedly".
+    #[tokio::test]
+    async fn unknown_server_error_is_returned_with_its_message() {
+        let url = one_shot_server(r#"{"result":"GetHeadersError","message":"-45054 something new"}"#).await;
+        let client = AnisetteClient::new(url, LoginClientInfo::default()).await.unwrap();
+
+        let err = client.get_headers(&provisioned_state()).await.err().expect("must be an error");
+
+        assert!(matches!(err, AnisetteError::ServerError(ref m) if m.contains("-45054")), "{err:?}");
+    }
+
+    // The provider re-provisions on -45061 and used to panic on anything else,
+    // so a flaky anisette host (an HTML error page, a dropped connection) killed
+    // the login instead of failing it.
+    #[tokio::test]
+    async fn provider_returns_a_broken_server_response_as_an_error() {
+        let url = one_shot_server("<html>502 Bad Gateway</html>").await;
+        let dir = std::env::temp_dir().join(format!("omnisette-test-{}", std::process::id()));
+        let mut provider = RemoteAnisetteProviderV3::new(url, LoginClientInfo::default(), dir.clone());
+        provider.state = Some(provisioned_state());
+
+        let result = provider.get_anisette_headers().await;
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(result.is_err());
+    }
+
+    // -45061 is the one message the provider recovers from by re-provisioning.
+    #[tokio::test]
+    async fn not_provisioned_is_still_recognised() {
+        let url = one_shot_server(r#"{"result":"GetHeadersError","message":"-45061"}"#).await;
+        let client = AnisetteClient::new(url, LoginClientInfo::default()).await.unwrap();
+
+        let err = client.get_headers(&provisioned_state()).await.err().expect("must be an error");
+
+        assert!(matches!(err, AnisetteError::AnisetteNotProvisioned), "{err:?}");
+    }
+}
