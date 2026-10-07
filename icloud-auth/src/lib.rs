@@ -34,4 +34,8 @@ pub enum Error {
     SerdeError(#[from] serde_json::Error),
     #[error("Disable hardware authentication keys and try again!")]
     HardwareKeyError,
+    /// Apple refused to text the two-factor code. `message` is Apple's own
+    /// wording when the response carried one, so it is safe to show the user.
+    #[error("{message}")]
+    SmsSendFailed { status: u16, message: String },
 }

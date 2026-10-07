@@ -254,6 +254,49 @@ mod sms_phone_id_tests {
     }
 }
 
+/// The error for a refused `PUT /auth/verify/phone`. Apple's JSON auth errors list their reasons
+/// under `serviceErrors` (some endpoints spell it `service_errors`), and the first one's `message`
+/// is written for the account holder, so it becomes the error text. That this endpoint uses the
+/// same shape is unconfirmed until the error log below captures a real refusal; any other body
+/// gets fixed text that still names the step, never the generic "could not reach Apple".
+fn sms_send_error(status: u16, body: &str) -> Error {
+    let apple_message = serde_json::from_str::<serde_json::Value>(body).ok().and_then(|v| {
+        let first = v.get("serviceErrors").or(v.get("service_errors"))?.get(0)?;
+        let text = first.get("message").or(first.get("title"))?.as_str()?.trim();
+        (!text.is_empty()).then(|| text.to_string())
+    });
+    Error::SmsSendFailed {
+        status,
+        message: apple_message
+            .unwrap_or_else(|| "Apple would not send the verification code to your phone".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod sms_send_error_tests {
+    use super::*;
+
+    // Apple's reason (rate limit, number blocked, ...) tells the user what to do; ours cannot.
+    // The bodies are the documented shape, not captured responses.
+    #[test]
+    fn shows_apples_own_reason() {
+        let body = r#"{"serviceErrors":[{"code":"-28248","title":"Verification Failed","message":"Too many verification codes have been sent."}]}"#;
+        assert_eq!(sms_send_error(423, body).to_string(), "Too many verification codes have been sent.");
+        let snake = r#"{"service_errors":[{"code":"-1","title":"Not allowed"}]}"#;
+        assert_eq!(sms_send_error(400, snake).to_string(), "Not allowed");
+    }
+
+    // An HTML error page or an empty list still has to say which step failed, not leak the body.
+    #[test]
+    fn falls_back_to_naming_the_step() {
+        for body in ["<html>Bad Gateway</html>", "", r#"{"serviceErrors":[]}"#, r#"{"serviceErrors":[{"message":" "}]}"#] {
+            let e = sms_send_error(502, body);
+            assert!(matches!(e, Error::SmsSendFailed { status: 502, .. }));
+            assert_eq!(e.to_string(), "Apple would not send the verification code to your phone");
+        }
+    }
+}
+
 // impl Send2FAToDevices {
 //     pub fn send_2fa_to_devices(&self) -> LoginResponse {
 //         self.account.send_2fa_to_devices().unwrap()
@@ -919,7 +962,7 @@ impl<T: AnisetteProvider> AppleAccount<T> {
             let status = res.status();
             let body = res.text().await.unwrap_or_default();
             error!("send_sms_2fa_to_devices(phone_id={}) failed: HTTP {} — body: {}", phone_id, status, body);
-            return Err(Error::AuthSrp);
+            return Err(sms_send_error(status.as_u16(), &body));
         }
 
         return Ok(LoginState::NeedsSMS2FAVerification(body));
