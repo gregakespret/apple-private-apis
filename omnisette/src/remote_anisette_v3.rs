@@ -75,10 +75,6 @@ fn base64_encode(data: &[u8]) -> String {
     general_purpose::STANDARD.encode(data)
 }
 
-fn base64_decode(data: &str) -> Vec<u8> {
-    general_purpose::STANDARD.decode(data.trim()).unwrap()
-}
-
 
 #[derive(Serialize, Deserialize)]
 pub struct AnisetteState {
@@ -228,10 +224,17 @@ impl AnisetteClient {
             }
         }
 
-        let headers = http_client.post(path)
+        let resp = http_client.post(path)
             .json(&body)
-            .send().await?
-            .json::<AnisetteHeaders>().await?;
+            .send().await?;
+        // Read the text before parsing it: a broken host answers with an HTML
+        // error page, and reqwest's own JSON error keeps neither status nor text.
+        let status = resp.status();
+        let text = resp.text().await?;
+        let headers: AnisetteHeaders = serde_json::from_str(&text).map_err(|e| {
+            let snippet: String = text.chars().take(200).collect();
+            AnisetteError::ServerError(format!("HTTP {status}, unreadable reply ({e}): {snippet}"))
+        })?;
         match headers {
             AnisetteHeaders::GetHeadersError { message } => {
                 if message.contains("-45061") {
@@ -287,8 +290,12 @@ impl AnisetteClient {
         }
 
         loop {
-            let Some(Ok(data)) = connection.next().await else {
-                continue
+            // A socket dropped without a Close frame yields one error, then `None`
+            // forever: `continue` on those spun here, never yielding, holding the lock.
+            let data = match connection.next().await {
+                Some(Ok(data)) => data,
+                Some(Err(e)) => return Err(e.into()),
+                None => return Err(tokio_tungstenite::tungstenite::Error::ConnectionClosed.into()),
             };
             if data.is_text() {
                 let txt = data.to_text().unwrap();
@@ -348,7 +355,11 @@ impl AnisetteClient {
                     },
                     ProvisionInput::ProvisioningSuccess { adi_pb } => {
                         debug!("ProvisioningSuccess");
-                        state.adi_pb = Some(base64_decode(&adi_pb));
+                        // The server's bytes: a malformed adi_pb is its error, not our panic.
+                        let adi_pb = general_purpose::STANDARD.decode(adi_pb.trim()).map_err(|e| {
+                            AnisetteError::ServerError(format!("provisioning sent an adi_pb that is not base64: {e}"))
+                        })?;
+                        state.adi_pb = Some(adi_pb);
                         connection.close(None).await?;
                         break;
                     }
@@ -408,14 +419,13 @@ impl AnisetteProvider for RemoteAnisetteProviderV3 {
         }
         let data = match client.get_headers(&state).await {
             Ok(data) => data,
-            Err(err) => {
-                if matches!(err, AnisetteError::AnisetteNotProvisioned) {
-                    state.adi_pb = None;
-                    client.provision(state).await?;
-                    plist::to_file_xml(config_path, state)?;
-                    client.get_headers(&state).await?
-                } else { return Err(err) }
+            Err(AnisetteError::AnisetteNotProvisioned) => {
+                state.adi_pb = None;
+                client.provision(state).await?;
+                plist::to_file_xml(config_path, state)?;
+                client.get_headers(&state).await?
             },
+            Err(err) => return Err(err),
         };
         Ok(data.get_headers())
     }
@@ -464,7 +474,8 @@ mod tests {
 
     // The provider re-provisions on -45061 and used to panic on anything else,
     // so a flaky anisette host (an HTML error page, a dropped connection) killed
-    // the login instead of failing it.
+    // the login instead of failing it. The error must carry the page's text too,
+    // or the cause is lost all the same.
     #[tokio::test]
     async fn provider_returns_a_broken_server_response_as_an_error() {
         let url = one_shot_server("<html>502 Bad Gateway</html>").await;
@@ -475,7 +486,7 @@ mod tests {
         let result = provider.get_anisette_headers().await;
         let _ = fs::remove_dir_all(&dir);
 
-        assert!(result.is_err());
+        assert!(matches!(result, Err(AnisetteError::ServerError(ref m)) if m.contains("502 Bad Gateway")), "{result:?}");
     }
 
     // -45061 is the one message the provider recovers from by re-provisioning.

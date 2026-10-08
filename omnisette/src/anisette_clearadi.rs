@@ -345,14 +345,13 @@ impl AnisetteProvider for ClearADIClient {
         }
         let data = match self.get_headers(&state).await {
             Ok(data) => data,
-            Err(err) => {
-                if matches!(err, AnisetteError::AnisetteNotProvisioned) {
-                    state.provisioned = None;
-                    self.provision(&mut state).await?;
-                    plist::to_file_xml(config_path, &mut state)?;
-                    self.get_headers(&state).await?
-                } else { return Err(err) }
+            Err(AnisetteError::AnisetteNotProvisioned) => {
+                state.provisioned = None;
+                self.provision(&mut state).await?;
+                plist::to_file_xml(config_path, &mut state)?;
+                self.get_headers(&state).await?
             },
+            Err(err) => return Err(err),
         };
         Ok(data.get_headers())
     }
