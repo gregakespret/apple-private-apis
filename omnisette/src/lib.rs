@@ -42,6 +42,10 @@ pub enum AnisetteError {
     InvalidArgument(String),
     #[error("Anisette not provisioned!")]
     AnisetteNotProvisioned,
+    // The anisette server answered, but not with usable data: its own
+    // `GetHeadersError` message (other than -45061), or a malformed reply.
+    #[error("Anisette server error: {0}")]
+    ServerError(String),
     #[error("Plist serialization error {0}")]
     PlistError(#[from] plist::Error),
     #[error("Request Error {0}")]
