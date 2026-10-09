@@ -172,7 +172,7 @@ pub struct CircleResponse {
 }
 
 #[repr(C)]
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct TrustedPhoneNumber {
     pub number_with_dial_code: String,
@@ -214,6 +214,13 @@ fn sms_phone_id(extras: Result<&AuthenticationExtras, &Error>) -> Result<u32, Er
     }
 }
 
+/// The masked number (Apple's `numberWithDialCode`, e.g. "+1 (•••) •••-••12") of the phone the
+/// code was texted to, so the code prompt can say which phone to look at. `None` when the trusted
+/// phones could not be read and the code went to the fallback id 1, whose number we never saw.
+fn sms_sent_to(phones: &[TrustedPhoneNumber], phone_id: u32) -> Option<&str> {
+    phones.iter().find(|p| p.id == phone_id).map(|p| p.number_with_dial_code.as_str())
+}
+
 #[cfg(test)]
 mod sms_phone_id_tests {
     use super::*;
@@ -251,6 +258,23 @@ mod sms_phone_id_tests {
     fn no_trusted_phone_is_an_error_not_a_send() {
         assert!(matches!(sms_phone_id(Err(&Error::HardwareKeyError)), Err(Error::HardwareKeyError)));
         assert!(matches!(sms_phone_id(Ok(&extras_with_ids(&[]))), Err(Error::HardwareKeyError)));
+    }
+
+    // The prompt must name the phone the code actually went to: naming another of the account's
+    // numbers sends the user to a phone with no text on it.
+    #[test]
+    fn names_the_phone_that_was_texted() {
+        let phones: Vec<TrustedPhoneNumber> = serde_json::from_value(json!([
+            {"numberWithDialCode": "+386 •• ••• ••34", "lastTwoDigits": "34", "pushMode": "sms", "id": 2},
+            {"numberWithDialCode": "+1 (•••) •••-••12", "lastTwoDigits": "12", "pushMode": "sms", "id": 3},
+        ])).unwrap();
+        assert_eq!(sms_sent_to(&phones, 3), Some("+1 (•••) •••-••12"));
+    }
+
+    // After a failed lookup the code goes to id 1 blind; guessing a number there could be wrong.
+    #[test]
+    fn names_no_phone_when_the_lookup_failed() {
+        assert_eq!(sms_sent_to(&[], 1), None);
     }
 }
 
@@ -344,7 +368,7 @@ impl<T: AnisetteProvider> AppleAccount<T> {
 
     pub async fn login(
         appleid_closure: impl Fn() -> (String, Vec<u8>),
-        tfa_closure: impl Fn() -> String,
+        tfa_closure: impl Fn(Option<&str>) -> String,
         client_info: LoginClientInfo,
         anisette: ArcAnisetteClient<T>
     ) -> Result<AppleAccount<T>, Error> {
@@ -370,7 +394,8 @@ impl<T: AnisetteProvider> AppleAccount<T> {
     /// # Arguments
     ///
     /// * `appleid_closure` - A closure that takes no arguments and returns a tuple of the Apple ID and password
-    /// * `tfa_closure` - A closure that takes no arguments and returns the 2FA code
+    /// * `tfa_closure` - A closure that returns the 2FA code. Its argument is the masked number of
+    ///   the phone the code was texted to (see `sms_sent_to`), `None` when that is not known
     /// * `anisette` - AnisetteData
     /// # Examples
     ///
@@ -387,7 +412,7 @@ impl<T: AnisetteProvider> AppleAccount<T> {
     /// ```
     /// Note: You would not provide the 2FA code like this, you would have to actually ask input for it.
     //TODO: add login_with_anisette and login, where login autodetcts anisette
-    pub async fn login_with_anisette<F: Fn() -> (String, Vec<u8>), G: Fn() -> String>(
+    pub async fn login_with_anisette<F: Fn() -> (String, Vec<u8>), G: Fn(Option<&str>) -> String>(
         appleid_closure: F,
         tfa_closure: G,
         client_info: LoginClientInfo,
@@ -397,17 +422,23 @@ impl<T: AnisetteProvider> AppleAccount<T> {
         let (username, password) = appleid_closure();
 
         let mut response = _self.login_email_pass(&username, &password).await?;
+        // The account's trusted phones, kept so the code prompt can name the one that was texted.
+        let mut trusted_phones: Vec<TrustedPhoneNumber> = Vec::new();
         loop {
             match response {
                 // LoginState::NeedsDevice2FA => response = _self.send_2fa_to_devices().await?,
                 LoginState::Needs2FAVerification => {
-                    response = _self.verify_2fa(tfa_closure()).await?
+                    response = _self.verify_2fa(tfa_closure(None)).await?
                 }
                 LoginState::NeedsSMS2FA | LoginState::NeedsDevice2FA => {
                     _self.send_2fa_to_devices().await?;
                     // Phone ids are per account, not a fixed 1: an account whose trusted number was
                     // replaced has only higher ids, and Apple rejects the send for every attempt.
-                    response = match _self.get_auth_extras().await {
+                    let extras = _self.get_auth_extras().await;
+                    if let Ok(e) = &extras {
+                        trusted_phones = e.trusted_phone_numbers.clone();
+                    }
+                    response = match extras {
                         // A 201 from GET /auth means Apple already sent the code; a second send
                         // would invalidate the first code or trip Apple's send limit.
                         Ok(AuthenticationExtras { new_state: Some(state), .. }) => state,
@@ -415,7 +446,8 @@ impl<T: AnisetteProvider> AppleAccount<T> {
                     }
                 }
                 LoginState::NeedsSMS2FAVerification(body) => {
-                    response = _self.verify_sms_2fa(tfa_closure(), body).await?
+                    let code = tfa_closure(sms_sent_to(&trusted_phones, body.phone_number.id));
+                    response = _self.verify_sms_2fa(code, body).await?
                 }
                 LoginState::NeedsLogin => {
                     response = _self.login_email_pass(&username, &password).await?
