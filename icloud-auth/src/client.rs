@@ -825,7 +825,7 @@ impl<T: AnisetteProvider> AppleAccount<T> {
             .send().await;
 
         let res = parse_response(res).await?;
-        let err_check = Self::check_error(&res);
+        let err_check = Self::check_error("init", &res);
         if err_check.is_err() {
             return Err(err_check.err().unwrap());
         }
@@ -888,7 +888,7 @@ impl<T: AnisetteProvider> AppleAccount<T> {
             .send().await;
 
         let res = parse_response(res).await?;
-        let err_check = Self::check_error(&res);
+        let err_check = Self::check_error("complete", &res);
         if err_check.is_err() {
             return Err(err_check.err().unwrap());
         }
@@ -1092,7 +1092,7 @@ impl<T: AnisetteProvider> AppleAccount<T> {
         let res: plist::Dictionary =
             plist::from_bytes(res.text().await?.as_bytes())?;
 
-        Self::check_error(&res)?;
+        Self::check_error("validate", &res)?;
 
         // this endpoint is stupid
         // in the SMS 2fa endpoint, all tokens have format ID:TOKEN:DURATION:EXP (MS SINCE EPOCH)
@@ -1182,16 +1182,23 @@ impl<T: AnisetteProvider> AppleAccount<T> {
         self.tokens.insert("com.apple.gs.idms.pet".to_string(), FetchedToken { token: decoded.split(":").nth(1).unwrap().to_string(), expiration: SystemTime::now() + Duration::from_secs(decoded.split(":").nth(2).map(|a| a.parse::<u64>().expect("Bad pet format")).unwrap_or(300)) });
     }
 
-    fn check_error(res: &plist::Dictionary) -> Result<(), Error> {
-        let res = match res.get("Status") {
+    /// `step` names the request in the log line; the error returned is the same
+    /// for every step.
+    fn check_error(step: &str, res: &plist::Dictionary) -> Result<(), Error> {
+        let status = match res.get("Status") {
             Some(plist::Value::Dictionary(d)) => d,
-            _ => &res,
+            _ => res,
         };
 
-        if res.get("ec").unwrap().as_signed_integer().unwrap() != 0 {
+        if status.get("ec").unwrap().as_signed_integer().unwrap() != 0 {
+            // The error keeps only ec and em. Whatever else Apple sent is the only
+            // evidence of why it refused (as with -80045), so log the response
+            // whole. It holds no usable secret: session tokens arrive in `spd`,
+            // encrypted with the SRP session key, which is never logged.
+            warn!("GSA {} failed; Apple's full response: {:?}", step, res);
             return Err(Error::AuthSrpWithMessage(
-                res.get("ec").unwrap().as_signed_integer().unwrap(),
-                res.get("em").unwrap().as_string().unwrap().to_owned(),
+                status.get("ec").unwrap().as_signed_integer().unwrap(),
+                status.get("em").unwrap().as_string().unwrap().to_owned(),
             ));
         }
 
