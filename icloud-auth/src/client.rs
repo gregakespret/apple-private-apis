@@ -296,6 +296,31 @@ fn sms_send_error(status: u16, body: &str) -> Error {
     }
 }
 
+/// What a failed 2FA request may log about Apple's reply: the status and each `serviceErrors`
+/// entry's code, title and message. Never the reply itself: a rejected security code comes back
+/// with the typed code and the account's trusted phone numbers in it.
+fn apple_error_summary(status: u16, body: &str) -> String {
+    fn field(error: &serde_json::Value, key: &str) -> String {
+        match error.get(key) {
+            Some(serde_json::Value::String(s)) => s.trim().to_string(),
+            Some(serde_json::Value::Number(n)) => n.to_string(),
+            _ => String::new(),
+        }
+    }
+    let errors: Vec<String> = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("serviceErrors").or(v.get("service_errors"))?.as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .map(|e| format!("{} \"{}\": {}", field(e, "code"), field(e, "title"), field(e, "message")))
+        .collect();
+    if errors.is_empty() {
+        format!("HTTP {status}, no Apple error in a {}-byte reply", body.len())
+    } else {
+        format!("HTTP {status}, Apple error {}", errors.join("; "))
+    }
+}
+
 #[cfg(test)]
 mod sms_send_error_tests {
     use super::*;
@@ -317,6 +342,42 @@ mod sms_send_error_tests {
             let e = sms_send_error(502, body);
             assert!(matches!(e, Error::SmsSendFailed { status: 502, .. }));
             assert_eq!(e.to_string(), "Apple would not send the verification code to your phone");
+        }
+    }
+}
+
+#[cfg(test)]
+mod apple_error_summary_tests {
+    use super::*;
+
+    // The shape of a rejected POST /auth/verify/phone/securitycode, with made-up values: the
+    // reply echoes the typed code and the trusted phones, and its prose can name the account.
+    const REJECTED_CODE: &str = r#"{
+      "securityCode" : { "code" : "482913", "tooManyCodesSent" : false, "securityCodeLocked" : false },
+      "trustedPhoneNumbers" : [ { "numberWithDialCode" : "+1 (•••) •••-••47", "obfuscatedNumber" : "(•••) •••-••47", "lastTwoDigits" : "47", "id" : 1 } ],
+      "phoneNumber" : { "numberWithDialCode" : "+1 (•••) •••-••47", "lastTwoDigits" : "47", "id" : 1 },
+      "content" : { "enterCodeDescription" : "Enter the code sent for someone@example.com" },
+      "serviceErrors" : [ { "code" : "-21669", "title" : "Incorrect Verification Code", "message" : "Incorrect verification code.", "suppressDismissal" : false } ]
+    }"#;
+
+    // The log line is what the stuck-connecting runbook reads to tell a mistyped code from an
+    // Apple outage, so Apple's code and wording must survive; nothing typed or account-bound may.
+    #[test]
+    fn keeps_apples_error_and_drops_the_echoed_code_phone_and_account() {
+        let line = apple_error_summary(400, REJECTED_CODE);
+        assert_eq!(line, r#"HTTP 400, Apple error -21669 "Incorrect Verification Code": Incorrect verification code."#);
+        for leaked in ["482913", "47", "someone@example.com", "•"] {
+            assert!(!line.contains(leaked), "{leaked:?} reached the log line: {line}");
+        }
+    }
+
+    // A reply with no serviceErrors (an HTML error page, a proxy's 5xx) is not ours to read and may
+    // be anything; only its size says it was there.
+    #[test]
+    fn a_reply_without_apples_errors_is_never_echoed() {
+        for body in ["<html>482913 someone@example.com</html>", "", r#"{"serviceErrors":[]}"#, r#"{"securityCode":{"code":"482913"}}"#] {
+            let line = apple_error_summary(502, body);
+            assert_eq!(line, format!("HTTP 502, no Apple error in a {}-byte reply", body.len()));
         }
     }
 }
@@ -963,7 +1024,7 @@ impl<T: AnisetteProvider> AppleAccount<T> {
         if !res.status().is_success() {
             let status = res.status();
             let body = res.text().await.unwrap_or_default();
-            error!("send_2fa_to_devices failed: HTTP {} — body: {}", status, body);
+            error!("send_2fa_to_devices failed: {}", apple_error_summary(status.as_u16(), &body));
             return Err(Error::AuthSrp);
         }
 
@@ -993,7 +1054,7 @@ impl<T: AnisetteProvider> AppleAccount<T> {
         if !res.status().is_success() {
             let status = res.status();
             let body = res.text().await.unwrap_or_default();
-            error!("send_sms_2fa_to_devices(phone_id={}) failed: HTTP {} — body: {}", phone_id, status, body);
+            error!("send_sms_2fa_to_devices(phone_id={}) failed: {}", phone_id, apple_error_summary(status.as_u16(), &body));
             return Err(sms_send_error(status.as_u16(), &body));
         }
 
@@ -1011,7 +1072,7 @@ impl<T: AnisetteProvider> AppleAccount<T> {
         let status = req.status().as_u16();
         if status == 403 {
             let body = req.bytes().await?;
-            warn!("Got auth response {}", base64::encode(&body));
+            warn!("Got auth response {}", apple_error_summary(status, &String::from_utf8_lossy(&body)));
             return Err(Error::FailedGetting2FAConfig);
         }
         let resp = req.bytes().await?;
@@ -1146,7 +1207,8 @@ impl<T: AnisetteProvider> AppleAccount<T> {
             .send().await?;
 
         if res.status() != 200 {
-            error!("Security code failed, response: {}", res.text().await?);
+            let status = res.status().as_u16();
+            error!("Security code failed: {}", apple_error_summary(status, &res.text().await?));
             return Err(Error::Bad2faCode);
         }
 
