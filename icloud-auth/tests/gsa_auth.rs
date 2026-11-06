@@ -27,7 +27,7 @@ mod tests {
             println!("Enter 2FA code: ");
             let mut input = String::new();
             std::io::stdin().read_line(&mut input).unwrap();
-            Some(input.trim().to_string())
+            Some(TfaAnswer::Code(input.trim().to_string()))
         };
         let info = LoginClientInfo {
             ak_context_type: "imessage".to_string(),

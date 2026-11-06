@@ -2,7 +2,7 @@ pub mod anisette;
 mod client;
 use std::fmt::Display;
 
-pub use client::{AppleAccount, LoginState, TfaPrompt, TrustedPhoneNumber, AuthenticationExtras, VerifyBody, CircleSendMessage, GenerateVerificationTokenRequest};
+pub use client::{AppleAccount, LoginState, TfaPrompt, TfaAnswer, PhoneChoice, PhoneReason, TrustedPhoneNumber, AuthenticationExtras, VerifyBody, CircleSendMessage, GenerateVerificationTokenRequest};
 pub use omnisette::{LoginClientInfo, default_provider, ArcAnisetteClient, DefaultAnisetteProvider};
 
 
