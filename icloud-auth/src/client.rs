@@ -186,9 +186,10 @@ pub struct TrustedPhoneNumber {
 pub struct AuthenticationExtras {
     #[serde(default)]
     pub trusted_phone_numbers: Vec<TrustedPhoneNumber>,
-    /// The phone Apple itself would text, the account holder's choice in their Apple ID settings.
-    #[serde(default, deserialize_with = "lenient_phone")]
-    pub trusted_phone_number: Option<TrustedPhoneNumber>,
+    /// The id of the phone Apple itself would text (`trustedPhoneNumber`), the account holder's
+    /// choice in their Apple ID settings.
+    #[serde(default, rename = "trustedPhoneNumber", deserialize_with = "lenient_phone_id")]
+    pub default_phone_id: Option<u32>,
     pub recovery_url: Option<String>,
     pub cant_use_phone_number_url: Option<String>,
     pub dont_have_access_url: Option<String>,
@@ -199,18 +200,17 @@ pub struct AuthenticationExtras {
     pub new_state: Option<LoginState>,
 }
 
-/// Apple's default phone, or `None` for one in a shape we cannot read. Its shape is unconfirmed
-/// (production logs hide this reply), and failing the whole `GET /auth` parse over it would lose
-/// the phone list too, sending every account to the blind id-1 fallback.
-fn lenient_phone<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<TrustedPhoneNumber>, D::Error> {
+/// The id of Apple's default phone, or `None` when it has none we can read. Only the id is used, so
+/// only the id is required: a default missing some other field must still win over id 1. Failing
+/// the whole `GET /auth` parse over it would lose the phone list too, sending every account to the
+/// blind id-1 fallback.
+fn lenient_phone_id<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u32>, D::Error> {
     let value = Option::<serde_json::Value>::deserialize(d)?;
-    Ok(value.and_then(|v| match serde_json::from_value(v) {
-        Ok(phone) => Some(phone),
-        Err(e) => {
-            warn!("Could not read Apple's default trusted phone ({}); choosing without it", e);
-            None
-        }
-    }))
+    let id = value.as_ref().map(|v| v.get("id").and_then(|id| id.as_u64()).and_then(|id| u32::try_from(id).ok()));
+    if let Some(None) = id {
+        warn!("Could not read the id of Apple's default trusted phone; choosing without it");
+    }
+    Ok(id.flatten())
 }
 
 /// Why the code went to the phone it did.
@@ -242,7 +242,7 @@ pub struct PhoneChoice {
 fn default_phone(extras: &AuthenticationExtras) -> Option<PhoneChoice> {
     let phones = &extras.trusted_phone_numbers;
     let listed = |id: u32| phones.iter().any(|p| p.id == id);
-    let (id, reason) = match extras.trusted_phone_number.as_ref().map(|p| p.id) {
+    let (id, reason) = match extras.default_phone_id {
         Some(id) if listed(id) => (id, PhoneReason::AppleDefault),
         _ if listed(1) => (1, PhoneReason::IdOne),
         _ => (phones.first()?.id, PhoneReason::FirstListed),
@@ -320,13 +320,21 @@ mod sms_phone_id_tests {
         assert_eq!(sms_phone_id(Ok(&extras(&[3, 2], None))).unwrap(), choice(3, PhoneReason::FirstListed));
     }
 
-    // Apple's default is in a shape nobody has logged yet. A shape we cannot read must cost only the
-    // default, not the phone list beside it.
+    // Apple's default is in a shape nobody has logged in full. A shape we cannot read must cost only
+    // the default, not the phone list beside it.
     #[test]
     fn an_unreadable_default_still_reads_the_phones() {
         let e = extras(&[3, 2], Some(json!({"id": "not a number"})));
-        assert_eq!(e.trusted_phone_number, None);
+        assert_eq!(e.default_phone_id, None);
         assert_eq!(sms_phone_id(Ok(&e)).unwrap(), choice(3, PhoneReason::FirstListed));
+    }
+
+    // Only the id is used. A default missing any other field (no `pushMode`, say) must still win:
+    // dropped, the code would go to id 1, the bug this exists for.
+    #[test]
+    fn a_default_with_only_an_id_still_wins() {
+        let e = extras(&[1, 2], Some(json!({"id": 2})));
+        assert_eq!(sms_phone_id(Ok(&e)).unwrap(), choice(2, PhoneReason::AppleDefault));
     }
 
     // A failed lookup must not make things worse than the old hardcoded 1, which works for most accounts.
@@ -422,6 +430,20 @@ pub struct TfaPrompt<'a> {
     pub texted: Option<PhoneChoice>,
     /// The id of Apple's default phone, whether or not it was listed.
     pub apple_default: Option<u32>,
+    /// How many texts this sign-in has sent, counting the one awaited: 1 for the first, one more
+    /// for each phone switch Apple sent. A change means a new text, with its own code.
+    pub texts: u32,
+    /// The phone the previous answer asked to text, and why it was not texted, on the ask right
+    /// after a `TextPhone` that failed. The text awaited is the one before; its code still works.
+    pub switch_refused: Option<SwitchRefused<'a>>,
+}
+
+/// A `TfaAnswer::TextPhone` that did not send a text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SwitchRefused<'a> {
+    pub id: u32,
+    /// Apple's reason (e.g. its send limit), or ours for a phone the account does not list.
+    pub reason: &'a str,
 }
 
 impl<'a> TfaPrompt<'a> {
@@ -438,7 +460,8 @@ pub enum TfaAnswer {
     /// The code to post to Apple.
     Code(String),
     /// The code went to a phone the user does not have: text this one of `TfaPrompt::phones`
-    /// instead, then ask again.
+    /// instead, then ask again. If it is not listed, or Apple will not text it, the ask comes again
+    /// for the text already sent, with `TfaPrompt::switch_refused` saying why.
     TextPhone(u32),
 }
 
@@ -607,12 +630,12 @@ impl<T: AnisetteProvider> AppleAccount<T> {
     ///   text. `TfaAnswer::TextPhone` texts another of the phones and asks again for that text.
     ///   `None` gives up: the login fails with `Bad2faCode` and sends Apple nothing. Apple's own
     ///   flags end the retypes eventually (see `code_can_be_retyped`), but a prompt that wants
-    ///   fewer stops on `refused`
+    ///   fewer stops on `refused`, and one that wants fewer texts stops offering phones on `texts`
     /// * `anisette` - AnisetteData
     /// # Examples
     ///
-    /// ```
-    /// use icloud_auth::AppleAccount;
+    /// ```ignore
+    /// use icloud_auth::{AppleAccount, TfaAnswer};
     /// use omnisette::AnisetteData;
     ///
     /// let anisette = AnisetteData::new();
@@ -637,54 +660,69 @@ impl<T: AnisetteProvider> AppleAccount<T> {
         // The account's trusted phones and Apple's default, kept for the code prompt.
         let mut trusted_phones: Vec<TrustedPhoneNumber> = Vec::new();
         let mut apple_default: Option<u32> = None;
-        // The phone the code now awaited was texted to.
-        let mut texted: Option<PhoneChoice> = None;
-        // Codes Apple has refused for the text now awaited; see `TfaPrompt::refused`.
+        // Why the code now awaited went to its phone. The phone itself is the awaited
+        // `VerifyBody`'s, so the prompt cannot name a phone the code is not checked against.
+        let mut texted_reason = PhoneReason::LookupFailed;
+        // Texts sent this sign-in, and codes Apple has refused for the one awaited; see `TfaPrompt`.
+        let mut texts = 0;
         let mut refused = 0;
+        // A `TextPhone` that sent nothing, reported on the next ask only.
+        let mut switch_refused: Option<(u32, String)> = None;
         loop {
             match response {
                 // LoginState::NeedsDevice2FA => response = _self.send_2fa_to_devices().await?,
                 LoginState::Needs2FAVerification => {
-                    let prompt = TfaPrompt { refused: 0, phones: &trusted_phones, texted: None, apple_default };
+                    let prompt = TfaPrompt {
+                        refused: 0, phones: &[], texted: None, apple_default: None, texts, switch_refused: None,
+                    };
                     response = match tfa_closure(prompt).ok_or(Error::Bad2faCode)? {
                         TfaAnswer::Code(code) => _self.verify_2fa(code).await?,
-                        TfaAnswer::TextPhone(id) => {
-                            texted = Some(PhoneChoice { id, reason: PhoneReason::UserSwitch });
-                            refused = 0;
-                            _self.send_sms_2fa_to_devices(id).await?
-                        }
+                        // No text was sent on this path and the prompt was offered no phones, so
+                        // there is nothing to switch from.
+                        TfaAnswer::TextPhone(_) => return Err(Error::Bad2faCode),
                     }
                 }
                 LoginState::NeedsSMS2FA | LoginState::NeedsDevice2FA => {
                     // A new text, so nothing has been refused for it yet.
                     refused = 0;
+                    switch_refused = None;
                     _self.send_2fa_to_devices().await?;
                     // Phone ids are per account, not a fixed 1: an account whose trusted number was
                     // replaced has only higher ids, and Apple rejects the send for every attempt.
                     let extras = _self.get_auth_extras().await;
-                    if let Ok(e) = &extras {
-                        trusted_phones = e.trusted_phone_numbers.clone();
-                        apple_default = e.trusted_phone_number.as_ref().map(|p| p.id);
-                    }
+                    // A failed lookup clears what an earlier round read: the code then goes to id 1
+                    // blind, and naming or offering phones from before would be a guess.
+                    (trusted_phones, apple_default) = match &extras {
+                        Ok(e) => (e.trusted_phone_numbers.clone(), e.default_phone_id),
+                        Err(_) => (Vec::new(), None),
+                    };
                     response = match extras {
                         // A 201 from GET /auth means Apple already sent the code; a second send
                         // would invalidate the first code or trip Apple's send limit.
                         Ok(AuthenticationExtras { new_state: Some(state), .. }) => {
-                            if let LoginState::NeedsSMS2FAVerification(body) = &state {
-                                texted = Some(PhoneChoice { id: body.phone_number.id, reason: PhoneReason::AppleSent });
-                            }
+                            texted_reason = PhoneReason::AppleSent;
                             state
                         }
                         extras => {
                             let choice = sms_phone_id(extras.as_ref())?;
-                            texted = Some(choice);
+                            texted_reason = choice.reason;
                             _self.send_sms_2fa_to_devices(choice.id).await?
                         }
-                    }
+                    };
+                    texts += 1;
                 }
                 LoginState::NeedsSMS2FAVerification(body) => {
-                    let prompt = TfaPrompt { refused, phones: &trusted_phones, texted, apple_default };
-                    response = match tfa_closure(prompt).ok_or(Error::Bad2faCode)? {
+                    let prompt = TfaPrompt {
+                        refused,
+                        phones: &trusted_phones,
+                        texted: Some(PhoneChoice { id: body.phone_number.id, reason: texted_reason }),
+                        apple_default,
+                        texts,
+                        switch_refused: switch_refused.as_ref().map(|(id, reason)| SwitchRefused { id: *id, reason }),
+                    };
+                    let answer = tfa_closure(prompt).ok_or(Error::Bad2faCode)?;
+                    switch_refused = None;
+                    response = match answer {
                         TfaAnswer::Code(code) => match _self.verify_sms_2fa(code, body.clone()).await {
                             // Ask again for the same text rather than fail: a fresh sign-in texts a
                             // new code, and the one the user already has stops working.
@@ -694,13 +732,31 @@ impl<T: AnisetteProvider> AppleAccount<T> {
                             }
                             verified => verified?,
                         },
+                        // Apple would refuse a send to a phone the account does not list, and the
+                        // refusal would spend one of the account's texts.
+                        TfaAnswer::TextPhone(id) if !trusted_phones.iter().any(|p| p.id == id) => {
+                            switch_refused =
+                                Some((id, "That phone is not one of this Apple ID's trusted phones.".to_string()));
+                            LoginState::NeedsSMS2FAVerification(body)
+                        }
                         // The code went to a phone the user does not have. A new text, so its own
                         // count of refusals.
-                        TfaAnswer::TextPhone(id) => {
-                            texted = Some(PhoneChoice { id, reason: PhoneReason::UserSwitch });
-                            refused = 0;
-                            _self.send_sms_2fa_to_devices(id).await?
-                        }
+                        TfaAnswer::TextPhone(id) => match _self.send_sms_2fa_to_devices(id).await {
+                            Ok(state) => {
+                                texted_reason = PhoneReason::UserSwitch;
+                                refused = 0;
+                                texts += 1;
+                                state
+                            }
+                            // Apple would not text that phone (its send limit, say). Nothing replaced
+                            // the text already sent, so ask for its code again: failing the sign-in
+                            // would make the user start over, which costs yet another text.
+                            Err(e @ Error::SmsSendFailed { .. }) => {
+                                switch_refused = Some((id, e.to_string()));
+                                LoginState::NeedsSMS2FAVerification(body)
+                            }
+                            Err(e) => return Err(e),
+                        },
                     }
                 }
                 LoginState::NeedsLogin => {
