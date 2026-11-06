@@ -278,14 +278,19 @@ mod sms_phone_id_tests {
     }
 }
 
-/// The error for a refused `PUT /auth/verify/phone`. Apple's JSON auth errors list their reasons
-/// under `serviceErrors` (some endpoints spell it `service_errors`), and the first one's `message`
-/// is written for the account holder, so it becomes the error text. That this endpoint uses the
+/// The reasons in one of Apple's JSON auth errors, listed under `serviceErrors` (some endpoints
+/// spell it `service_errors`).
+fn service_errors(v: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
+    v.get("serviceErrors").or_else(|| v.get("service_errors"))?.as_array()
+}
+
+/// The error for a refused `PUT /auth/verify/phone`. The first of Apple's `service_errors` has a
+/// `message` written for the account holder, so it becomes the error text. That this endpoint uses the
 /// same shape is unconfirmed until the error log below captures a real refusal; any other body
 /// gets fixed text that still names the step, never the generic "could not reach Apple".
 fn sms_send_error(status: u16, body: &str) -> Error {
     let apple_message = serde_json::from_str::<serde_json::Value>(body).ok().and_then(|v| {
-        let first = v.get("serviceErrors").or(v.get("service_errors"))?.get(0)?;
+        let first = service_errors(&v)?.first()?;
         let text = first.get("message").or(first.get("title"))?.as_str()?.trim();
         (!text.is_empty()).then(|| text.to_string())
     });
@@ -339,11 +344,14 @@ pub struct TfaPrompt<'a> {
 /// `tooManyCodesSent` is not one: it is about texts, and a retype sends none.
 fn code_can_be_retyped(body: &str) -> bool {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else { return false };
-    let wrong_code = v.get("serviceErrors").or(v.get("service_errors"))
-        .and_then(|errors| errors.as_array())
-        .is_some_and(|errors| errors.iter().any(|e| e.get("code").and_then(|c| c.as_str()) == Some("-21669")));
+    // Every reason must be the wrong code: another one beside it (a lock, say) is a refusal that
+    // a retype would only run into again.
+    let wrong_code = service_errors(&v).is_some_and(|errors| {
+        !errors.is_empty() && errors.iter().all(|e| e.get("code").and_then(|c| c.as_str()) == Some("-21669"))
+    });
+    let security_code = v.get("securityCode");
     let stop = ["tooManyCodesValidated", "securityCodeLocked", "securityCodeCooldown"].iter()
-        .any(|flag| v.get("securityCode").and_then(|s| s.get(flag)).and_then(|f| f.as_bool()).unwrap_or(false));
+        .any(|flag| security_code.and_then(|s| s.get(flag)).and_then(|f| f.as_bool()).unwrap_or(false));
     wrong_code && !stop
 }
 
@@ -396,6 +404,22 @@ mod code_can_be_retyped_tests {
         for body in ["<html>Bad Gateway</html>", "", r#"{"serviceErrors":[]}"#] {
             assert!(!code_can_be_retyped(body), "{body}");
         }
+    }
+
+    // A wrong code listed beside another reason (a lock) is not a plain typo: retyping would
+    // spend the user's attempts on a refusal that no code can get past.
+    #[test]
+    fn not_when_another_reason_comes_with_it() {
+        let mut body: serde_json::Value = serde_json::from_str(&refusal("-21669", json!({}))).unwrap();
+        body["serviceErrors"].as_array_mut().unwrap().push(json!({"code": "-20209", "title": "Locked"}));
+        assert!(!code_can_be_retyped(&body.to_string()));
+    }
+
+    // Some Apple endpoints spell the list `service_errors`; a typo must be retypable either way.
+    #[test]
+    fn reads_the_snake_case_spelling() {
+        let body = r#"{"service_errors":[{"code":"-21669"}],"securityCode":{"securityCodeLocked":false}}"#;
+        assert!(code_can_be_retyped(body));
     }
 }
 
@@ -487,7 +511,7 @@ impl<T: AnisetteProvider> AppleAccount<T> {
     /// let anisette = AnisetteData::new();
     /// let account = AppleAccount::login(
     ///   || ("test@waffle.me", "password")
-    ///   || "123123",
+    ///   |_prompt| Some("123123".to_string()),
     ///  anisette
     /// );
     /// ```
