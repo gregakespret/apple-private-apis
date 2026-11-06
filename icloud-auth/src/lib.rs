@@ -2,7 +2,7 @@ pub mod anisette;
 mod client;
 use std::fmt::Display;
 
-pub use client::{AppleAccount, LoginState, TrustedPhoneNumber, AuthenticationExtras, VerifyBody, CircleSendMessage, GenerateVerificationTokenRequest};
+pub use client::{AppleAccount, LoginState, TfaPrompt, TrustedPhoneNumber, AuthenticationExtras, VerifyBody, CircleSendMessage, GenerateVerificationTokenRequest};
 pub use omnisette::{LoginClientInfo, default_provider, ArcAnisetteClient, DefaultAnisetteProvider};
 
 
@@ -18,6 +18,10 @@ pub enum Error {
     HappyBirthdayError,
     #[error("Bad 2fa code.")]
     Bad2faCode,
+    /// Apple refused an SMS code but will take another for the same text (-21669). `login`
+    /// answers it by asking the prompt again, so only a direct caller of `verify_sms_2fa` sees it.
+    #[error("Incorrect verification code.")]
+    IncorrectCode,
     #[error("{1} ({0})")]
     AuthSrpWithMessage(i64, String),
     #[error("Please login to appleid.apple.com to fix this account")]

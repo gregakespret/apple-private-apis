@@ -278,14 +278,19 @@ mod sms_phone_id_tests {
     }
 }
 
-/// The error for a refused `PUT /auth/verify/phone`. Apple's JSON auth errors list their reasons
-/// under `serviceErrors` (some endpoints spell it `service_errors`), and the first one's `message`
-/// is written for the account holder, so it becomes the error text. That this endpoint uses the
+/// The reasons in one of Apple's JSON auth errors, listed under `serviceErrors` (some endpoints
+/// spell it `service_errors`).
+fn service_errors(v: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
+    v.get("serviceErrors").or_else(|| v.get("service_errors"))?.as_array()
+}
+
+/// The error for a refused `PUT /auth/verify/phone`. The first of Apple's `service_errors` has a
+/// `message` written for the account holder, so it becomes the error text. That this endpoint uses the
 /// same shape is unconfirmed until the error log below captures a real refusal; any other body
 /// gets fixed text that still names the step, never the generic "could not reach Apple".
 fn sms_send_error(status: u16, body: &str) -> Error {
     let apple_message = serde_json::from_str::<serde_json::Value>(body).ok().and_then(|v| {
-        let first = v.get("serviceErrors").or(v.get("service_errors"))?.get(0)?;
+        let first = service_errors(&v)?.first()?;
         let text = first.get("message").or(first.get("title"))?.as_str()?.trim();
         (!text.is_empty()).then(|| text.to_string())
     });
@@ -318,6 +323,103 @@ mod sms_send_error_tests {
             assert!(matches!(e, Error::SmsSendFailed { status: 502, .. }));
             assert_eq!(e.to_string(), "Apple would not send the verification code to your phone");
         }
+    }
+}
+
+/// What the login tells the 2FA prompt when it asks for a code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TfaPrompt<'a> {
+    /// The masked number of the phone the code was texted to (see `sms_sent_to`), `None` when that
+    /// is not known.
+    pub sent_to: Option<&'a str>,
+    /// How many codes Apple has refused for this text. Above 0 the ask is a retype: nothing new
+    /// was sent, and the code already in the user's messages is still the one to enter.
+    pub refused: u32,
+}
+
+/// Whether Apple's refusal of an SMS code leaves the same text open to a retype. Apple answers a
+/// wrong code with -21669 ("Incorrect Verification Code", "Try entering your verification code
+/// again.") and a `securityCode` object whose flags say when it will take no more. With any of
+/// those set, or any other refusal (a locked account, an outage page), the sign-in fails as before.
+/// `tooManyCodesSent` is not one: it is about texts, and a retype sends none.
+fn code_can_be_retyped(body: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else { return false };
+    // Every reason must be the wrong code: another one beside it (a lock, say) is a refusal that
+    // a retype would only run into again.
+    let wrong_code = service_errors(&v).is_some_and(|errors| {
+        !errors.is_empty() && errors.iter().all(|e| e.get("code").and_then(|c| c.as_str()) == Some("-21669"))
+    });
+    let security_code = v.get("securityCode");
+    let stop = ["tooManyCodesValidated", "securityCodeLocked", "securityCodeCooldown"].iter()
+        .any(|flag| security_code.and_then(|s| s.get(flag)).and_then(|f| f.as_bool()).unwrap_or(false));
+    wrong_code && !stop
+}
+
+#[cfg(test)]
+mod code_can_be_retyped_tests {
+    use super::*;
+
+    /// Apple's refusal of a wrong SMS code, in the shape it is logged in production, with made-up
+    /// values; `flags` overrides the `securityCode` flags.
+    fn refusal(error_code: &str, flags: serde_json::Value) -> String {
+        let mut security_code = json!({
+            "code": "000000", "tooManyCodesSent": false, "tooManyCodesValidated": false,
+            "securityCodeLocked": false, "securityCodeCooldown": false
+        });
+        security_code.as_object_mut().unwrap().extend(flags.as_object().unwrap().clone());
+        json!({
+            "securityCode": security_code, "mode": "sms", "clientActionCancel": false,
+            "serviceErrors": [{"code": error_code, "title": "Incorrect Verification Code",
+                               "message": "Try entering your verification code again."}]
+        }).to_string()
+    }
+
+    // The bug this exists for: a typo failed the whole sign-in, the next attempt texted a new
+    // code, and the code the user already had stopped working, so some users went round that
+    // loop until Apple stopped texting them.
+    #[test]
+    fn a_wrong_code_can_be_retyped() {
+        assert!(code_can_be_retyped(&refusal("-21669", json!({}))));
+    }
+
+    // A text Apple has stopped accepting codes for will refuse the retype too; asking again only
+    // spends the user's attempts against a lock.
+    #[test]
+    fn not_once_apple_says_stop() {
+        for flag in ["tooManyCodesValidated", "securityCodeLocked", "securityCodeCooldown"] {
+            assert!(!code_can_be_retyped(&refusal("-21669", json!({ flag: true }))), "{flag}");
+        }
+    }
+
+    // Too many texts is a reason to retype rather than restart: a restart is what sends another.
+    #[test]
+    fn too_many_texts_sent_still_allows_a_retype() {
+        assert!(code_can_be_retyped(&refusal("-21669", json!({"tooManyCodesSent": true}))));
+    }
+
+    // Any other refusal (a locked account, an outage page) is not Apple asking for the code again.
+    #[test]
+    fn other_refusals_end_the_sign_in() {
+        assert!(!code_can_be_retyped(&refusal("-20209", json!({}))));
+        for body in ["<html>Bad Gateway</html>", "", r#"{"serviceErrors":[]}"#] {
+            assert!(!code_can_be_retyped(body), "{body}");
+        }
+    }
+
+    // A wrong code listed beside another reason (a lock) is not a plain typo: retyping would
+    // spend the user's attempts on a refusal that no code can get past.
+    #[test]
+    fn not_when_another_reason_comes_with_it() {
+        let mut body: serde_json::Value = serde_json::from_str(&refusal("-21669", json!({}))).unwrap();
+        body["serviceErrors"].as_array_mut().unwrap().push(json!({"code": "-20209", "title": "Locked"}));
+        assert!(!code_can_be_retyped(&body.to_string()));
+    }
+
+    // Some Apple endpoints spell the list `service_errors`; a typo must be retypable either way.
+    #[test]
+    fn reads_the_snake_case_spelling() {
+        let body = r#"{"service_errors":[{"code":"-21669"}],"securityCode":{"securityCodeLocked":false}}"#;
+        assert!(code_can_be_retyped(body));
     }
 }
 
@@ -368,7 +470,7 @@ impl<T: AnisetteProvider> AppleAccount<T> {
 
     pub async fn login(
         appleid_closure: impl Fn() -> (String, Vec<u8>),
-        tfa_closure: impl Fn(Option<&str>) -> String,
+        tfa_closure: impl Fn(TfaPrompt<'_>) -> Option<String>,
         client_info: LoginClientInfo,
         anisette: ArcAnisetteClient<T>
     ) -> Result<AppleAccount<T>, Error> {
@@ -394,8 +496,11 @@ impl<T: AnisetteProvider> AppleAccount<T> {
     /// # Arguments
     ///
     /// * `appleid_closure` - A closure that takes no arguments and returns a tuple of the Apple ID and password
-    /// * `tfa_closure` - A closure that returns the 2FA code. Its argument is the masked number of
-    ///   the phone the code was texted to (see `sms_sent_to`), `None` when that is not known
+    /// * `tfa_closure` - A closure that returns the 2FA code, told which phone it was texted to and
+    ///   how many codes Apple has already refused for that text (see `TfaPrompt`). A wrong code
+    ///   that Apple will take another try for asks again, for the same text. `None` gives up: the
+    ///   login fails with `Bad2faCode` and sends Apple nothing. Apple's own flags end the retypes
+    ///   eventually (see `code_can_be_retyped`), but a prompt that wants fewer stops on `refused`
     /// * `anisette` - AnisetteData
     /// # Examples
     ///
@@ -406,13 +511,13 @@ impl<T: AnisetteProvider> AppleAccount<T> {
     /// let anisette = AnisetteData::new();
     /// let account = AppleAccount::login(
     ///   || ("test@waffle.me", "password")
-    ///   || "123123",
+    ///   |_prompt| Some("123123".to_string()),
     ///  anisette
     /// );
     /// ```
     /// Note: You would not provide the 2FA code like this, you would have to actually ask input for it.
     //TODO: add login_with_anisette and login, where login autodetcts anisette
-    pub async fn login_with_anisette<F: Fn() -> (String, Vec<u8>), G: Fn(Option<&str>) -> String>(
+    pub async fn login_with_anisette<F: Fn() -> (String, Vec<u8>), G: Fn(TfaPrompt<'_>) -> Option<String>>(
         appleid_closure: F,
         tfa_closure: G,
         client_info: LoginClientInfo,
@@ -424,13 +529,18 @@ impl<T: AnisetteProvider> AppleAccount<T> {
         let mut response = _self.login_email_pass(&username, &password).await?;
         // The account's trusted phones, kept so the code prompt can name the one that was texted.
         let mut trusted_phones: Vec<TrustedPhoneNumber> = Vec::new();
+        // Codes Apple has refused for the text now awaited; see `TfaPrompt::refused`.
+        let mut refused = 0;
         loop {
             match response {
                 // LoginState::NeedsDevice2FA => response = _self.send_2fa_to_devices().await?,
                 LoginState::Needs2FAVerification => {
-                    response = _self.verify_2fa(tfa_closure(None)).await?
+                    let code = tfa_closure(TfaPrompt { sent_to: None, refused: 0 }).ok_or(Error::Bad2faCode)?;
+                    response = _self.verify_2fa(code).await?
                 }
                 LoginState::NeedsSMS2FA | LoginState::NeedsDevice2FA => {
+                    // A new text, so nothing has been refused for it yet.
+                    refused = 0;
                     _self.send_2fa_to_devices().await?;
                     // Phone ids are per account, not a fixed 1: an account whose trusted number was
                     // replaced has only higher ids, and Apple rejects the send for every attempt.
@@ -446,8 +556,17 @@ impl<T: AnisetteProvider> AppleAccount<T> {
                     }
                 }
                 LoginState::NeedsSMS2FAVerification(body) => {
-                    let code = tfa_closure(sms_sent_to(&trusted_phones, body.phone_number.id));
-                    response = _self.verify_sms_2fa(code, body).await?
+                    let sent_to = sms_sent_to(&trusted_phones, body.phone_number.id);
+                    let code = tfa_closure(TfaPrompt { sent_to, refused }).ok_or(Error::Bad2faCode)?;
+                    response = match _self.verify_sms_2fa(code, body.clone()).await {
+                        // Ask again for the same text rather than fail: a fresh sign-in texts a new
+                        // code, and the one the user already has stops working.
+                        Err(Error::IncorrectCode) => {
+                            refused += 1;
+                            LoginState::NeedsSMS2FAVerification(body)
+                        }
+                        verified => verified?,
+                    }
                 }
                 LoginState::NeedsLogin => {
                     response = _self.login_email_pass(&username, &password).await?
@@ -1146,8 +1265,9 @@ impl<T: AnisetteProvider> AppleAccount<T> {
             .send().await?;
 
         if res.status() != 200 {
-            error!("Security code failed, response: {}", res.text().await?);
-            return Err(Error::Bad2faCode);
+            let body = res.text().await?;
+            error!("Security code failed, response: {}", body);
+            return Err(if code_can_be_retyped(&body) { Error::IncorrectCode } else { Error::Bad2faCode });
         }
 
         self.tokens = res.headers().get_all("X-Apple-GS-Token").iter().chain(res.headers().get_all("X-Apple-HB-Token").iter()).map(|header| {
