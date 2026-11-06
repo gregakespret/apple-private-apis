@@ -34,4 +34,6 @@ jobs:
           toolchain: stable
       # --lib only: tests/gsa_auth.rs is a live sign-in that needs a real Apple
       # ID typed on stdin, and omnisette's test_adi provisions real anisette.
-      - run: cargo test -p icloud_auth --lib
+      # Off macOS, omnisette has no default anisette provider without a remote
+      # feature; remote-anisette-v3 is the one export-findmy builds with.
+      - run: cargo test -p icloud_auth --lib --features remote-anisette-v3
