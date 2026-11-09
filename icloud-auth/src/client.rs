@@ -392,6 +392,53 @@ fn sms_send_error(status: u16, body: &str) -> Error {
     }
 }
 
+/// The `securityCode` flags with which Apple takes no more codes for the text it sent.
+const SECURITY_CODE_STOP_FLAGS: [&str; 3] = ["tooManyCodesValidated", "securityCodeLocked", "securityCodeCooldown"];
+
+/// The stop flags Apple set in a reply. They are booleans, so naming them logs nothing typed or
+/// account-bound.
+fn security_code_stops(v: &serde_json::Value) -> Vec<&'static str> {
+    let security_code = v.get("securityCode");
+    SECURITY_CODE_STOP_FLAGS.into_iter()
+        .filter(|flag| security_code.and_then(|s| s.get(flag)).and_then(|f| f.as_bool()).unwrap_or(false))
+        .collect()
+}
+
+/// What a failed 2FA request may log about Apple's reply: the status, each `serviceErrors`
+/// entry's code, title and message, and the stop flags that decide whether a wrong code can be
+/// retyped. Never the reply itself: a rejected security code comes back
+/// with the typed code and the account's trusted phone numbers in it.
+fn apple_error_summary(status: u16, body: &str) -> String {
+    fn field(error: &serde_json::Value, key: &str) -> String {
+        match error.get(key) {
+            // Apple's prose can span lines; a line break would split the log record, and the
+            // second half would carry no session tag.
+            Some(serde_json::Value::String(s)) => s.trim().replace(|c: char| c.is_control(), " "),
+            Some(serde_json::Value::Number(n)) => n.to_string(),
+            _ => String::new(),
+        }
+    }
+    let reply = serde_json::from_str::<serde_json::Value>(body).ok();
+    let errors: Vec<String> = reply.as_ref()
+        .and_then(service_errors)
+        .into_iter()
+        .flatten()
+        .map(|e| [field(e, "code"), field(e, "title"), field(e, "message")])
+        // An entry with none of the three says nothing, so it counts as no Apple error.
+        .filter(|parts| parts.iter().any(|part| !part.is_empty()))
+        .map(|[code, title, message]| format!("{code} \"{title}\": {message}"))
+        .collect();
+    let summary = if errors.is_empty() {
+        format!("HTTP {status}, no Apple error in a {}-byte reply", body.len())
+    } else {
+        format!("HTTP {status}, Apple error {}", errors.join("; "))
+    };
+    match reply.as_ref().map(security_code_stops) {
+        Some(stops) if !stops.is_empty() => format!("{summary} [{}]", stops.join(", ")),
+        _ => summary,
+    }
+}
+
 #[cfg(test)]
 mod sms_send_error_tests {
     use super::*;
@@ -477,10 +524,7 @@ fn code_can_be_retyped(body: &str) -> bool {
     let wrong_code = service_errors(&v).is_some_and(|errors| {
         !errors.is_empty() && errors.iter().all(|e| e.get("code").and_then(|c| c.as_str()) == Some("-21669"))
     });
-    let security_code = v.get("securityCode");
-    let stop = ["tooManyCodesValidated", "securityCodeLocked", "securityCodeCooldown"].iter()
-        .any(|flag| security_code.and_then(|s| s.get(flag)).and_then(|f| f.as_bool()).unwrap_or(false));
-    wrong_code && !stop
+    wrong_code && security_code_stops(&v).is_empty()
 }
 
 #[cfg(test)]
@@ -548,6 +592,63 @@ mod code_can_be_retyped_tests {
     fn reads_the_snake_case_spelling() {
         let body = r#"{"service_errors":[{"code":"-21669"}],"securityCode":{"securityCodeLocked":false}}"#;
         assert!(code_can_be_retyped(body));
+    }
+}
+
+#[cfg(test)]
+mod apple_error_summary_tests {
+    use super::*;
+
+    // The shape of a rejected POST /auth/verify/phone/securitycode, with made-up values: the
+    // reply echoes the typed code and the trusted phones, and its prose can name the account.
+    const REJECTED_CODE: &str = r#"{
+      "securityCode" : { "code" : "482913", "tooManyCodesSent" : false, "securityCodeLocked" : false },
+      "trustedPhoneNumbers" : [ { "numberWithDialCode" : "+1 (•••) •••-••47", "obfuscatedNumber" : "(•••) •••-••47", "lastTwoDigits" : "47", "id" : 1 } ],
+      "phoneNumber" : { "numberWithDialCode" : "+1 (•••) •••-••47", "lastTwoDigits" : "47", "id" : 1 },
+      "content" : { "enterCodeDescription" : "Enter the code sent for someone@example.com" },
+      "serviceErrors" : [ { "code" : "-21669", "title" : "Incorrect Verification Code", "message" : "Incorrect verification code.", "suppressDismissal" : false } ]
+    }"#;
+
+    // The log line is what the stuck-connecting runbook reads to tell a mistyped code from an
+    // Apple outage, so Apple's code and wording must survive; nothing typed or account-bound may.
+    #[test]
+    fn keeps_apples_error_and_drops_the_echoed_code_phone_and_account() {
+        let line = apple_error_summary(400, REJECTED_CODE);
+        assert_eq!(line, r#"HTTP 400, Apple error -21669 "Incorrect Verification Code": Incorrect verification code."#);
+        for leaked in ["482913", "47", "someone@example.com", "•"] {
+            assert!(!line.contains(leaked), "{leaked:?} reached the log line: {line}");
+        }
+    }
+
+    // A reply with no serviceErrors (an HTML error page, a proxy's 5xx) is not ours to read and may
+    // be anything; only its size says it was there.
+    #[test]
+    fn a_reply_without_apples_errors_is_never_echoed() {
+        for body in [
+            "<html>482913 someone@example.com</html>", "", r#"{"serviceErrors":[]}"#, r#"{"securityCode":{"code":"482913"}}"#,
+            // An entry with no code, title or message is not an error we can name either.
+            r#"{"serviceErrors":[{"suppressDismissal":false},"482913"]}"#,
+        ] {
+            let line = apple_error_summary(502, body);
+            assert_eq!(line, format!("HTTP 502, no Apple error in a {}-byte reply", body.len()));
+        }
+    }
+
+    // A wrong code that cannot be retyped logs the same -21669 as one that can; only the flag
+    // says why the sign-in ended instead of asking again.
+    #[test]
+    fn names_the_flag_that_ended_the_retries() {
+        let body = r#"{"securityCode":{"code":"482913","securityCodeLocked":true,"securityCodeCooldown":false},"serviceErrors":[{"code":"-21669","title":"Incorrect Verification Code","message":"Incorrect verification code."}]}"#;
+        let line = apple_error_summary(400, body);
+        assert_eq!(line, r#"HTTP 400, Apple error -21669 "Incorrect Verification Code": Incorrect verification code. [securityCodeLocked]"#);
+    }
+
+    // Two sign-ins interleave in one log, and only a record's first line carries its session tag:
+    // a line break in Apple's wording would leave the rest of the reason belonging to nobody.
+    #[test]
+    fn apples_wording_stays_on_one_line() {
+        let body = r#"{"serviceErrors":[{"code":"-28248","title":"Verification Failed","message":"Too many codes.\nTry again later."}]}"#;
+        assert_eq!(apple_error_summary(423, body), r#"HTTP 423, Apple error -28248 "Verification Failed": Too many codes. Try again later."#);
     }
 }
 
@@ -1273,7 +1374,7 @@ impl<T: AnisetteProvider> AppleAccount<T> {
         if !res.status().is_success() {
             let status = res.status();
             let body = res.text().await.unwrap_or_default();
-            error!("send_2fa_to_devices failed: HTTP {} — body: {}", status, body);
+            error!("send_2fa_to_devices failed: {}", apple_error_summary(status.as_u16(), &body));
             return Err(Error::AuthSrp);
         }
 
@@ -1303,7 +1404,7 @@ impl<T: AnisetteProvider> AppleAccount<T> {
         if !res.status().is_success() {
             let status = res.status();
             let body = res.text().await.unwrap_or_default();
-            error!("send_sms_2fa_to_devices(phone_id={}) failed: HTTP {} — body: {}", phone_id, status, body);
+            error!("send_sms_2fa_to_devices(phone_id={}) failed: {}", phone_id, apple_error_summary(status.as_u16(), &body));
             return Err(sms_send_error(status.as_u16(), &body));
         }
 
@@ -1321,11 +1422,13 @@ impl<T: AnisetteProvider> AppleAccount<T> {
         let status = req.status().as_u16();
         if status == 403 {
             let body = req.bytes().await?;
-            warn!("Got auth response {}", base64::encode(&body));
+            warn!("Got auth response {}", apple_error_summary(status, &String::from_utf8_lossy(&body)));
             return Err(Error::FailedGetting2FAConfig);
         }
         let resp = req.bytes().await?;
-        info!("Got gsa auth extras {:?}", String::from_utf8_lossy(&resp));
+        // Not the reply: it lists the account's trusted phone numbers, and a refusal other than
+        // the 403 above arrives here too.
+        info!("Got gsa auth extras: HTTP {}, {} bytes", status, resp.len());
         let mut new_state: AuthenticationExtras = serde_json::from_slice(&resp)?;
         if new_state.trusted_phone_numbers.is_empty() {
             return Err(Error::HardwareKeyError);
@@ -1459,8 +1562,9 @@ impl<T: AnisetteProvider> AppleAccount<T> {
             .send().await?;
 
         if res.status() != 200 {
+            let status = res.status().as_u16();
             let body = res.text().await?;
-            error!("Security code failed, response: {}", body);
+            error!("Security code failed: {}", apple_error_summary(status, &body));
             return Err(if code_can_be_retyped(&body) { Error::IncorrectCode } else { Error::Bad2faCode });
         }
 
