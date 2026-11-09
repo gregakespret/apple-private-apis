@@ -302,17 +302,22 @@ fn sms_send_error(status: u16, body: &str) -> Error {
 fn apple_error_summary(status: u16, body: &str) -> String {
     fn field(error: &serde_json::Value, key: &str) -> String {
         match error.get(key) {
-            Some(serde_json::Value::String(s)) => s.trim().to_string(),
+            // Apple's prose can span lines; a line break would split the log record, and the
+            // second half would carry no session tag.
+            Some(serde_json::Value::String(s)) => s.trim().replace(|c: char| c.is_control(), " "),
             Some(serde_json::Value::Number(n)) => n.to_string(),
             _ => String::new(),
         }
     }
-    let errors: Vec<String> = serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| v.get("serviceErrors").or(v.get("service_errors"))?.as_array().cloned())
-        .unwrap_or_default()
-        .iter()
-        .map(|e| format!("{} \"{}\": {}", field(e, "code"), field(e, "title"), field(e, "message")))
+    let reply = serde_json::from_str::<serde_json::Value>(body).ok();
+    let errors: Vec<String> = reply.as_ref()
+        .and_then(|v| v.get("serviceErrors").or(v.get("service_errors"))?.as_array())
+        .into_iter()
+        .flatten()
+        .map(|e| [field(e, "code"), field(e, "title"), field(e, "message")])
+        // An entry with none of the three says nothing, so it counts as no Apple error.
+        .filter(|parts| parts.iter().any(|part| !part.is_empty()))
+        .map(|[code, title, message]| format!("{code} \"{title}\": {message}"))
         .collect();
     if errors.is_empty() {
         format!("HTTP {status}, no Apple error in a {}-byte reply", body.len())
@@ -375,10 +380,22 @@ mod apple_error_summary_tests {
     // be anything; only its size says it was there.
     #[test]
     fn a_reply_without_apples_errors_is_never_echoed() {
-        for body in ["<html>482913 someone@example.com</html>", "", r#"{"serviceErrors":[]}"#, r#"{"securityCode":{"code":"482913"}}"#] {
+        for body in [
+            "<html>482913 someone@example.com</html>", "", r#"{"serviceErrors":[]}"#, r#"{"securityCode":{"code":"482913"}}"#,
+            // An entry with no code, title or message is not an error we can name either.
+            r#"{"serviceErrors":[{"suppressDismissal":false},"482913"]}"#,
+        ] {
             let line = apple_error_summary(502, body);
             assert_eq!(line, format!("HTTP 502, no Apple error in a {}-byte reply", body.len()));
         }
+    }
+
+    // Two sign-ins interleave in one log, and only a record's first line carries its session tag:
+    // a line break in Apple's wording would leave the rest of the reason belonging to nobody.
+    #[test]
+    fn apples_wording_stays_on_one_line() {
+        let body = r#"{"serviceErrors":[{"code":"-28248","title":"Verification Failed","message":"Too many codes.\nTry again later."}]}"#;
+        assert_eq!(apple_error_summary(423, body), r#"HTTP 423, Apple error -28248 "Verification Failed": Too many codes. Try again later."#);
     }
 }
 
@@ -1076,7 +1093,9 @@ impl<T: AnisetteProvider> AppleAccount<T> {
             return Err(Error::FailedGetting2FAConfig);
         }
         let resp = req.bytes().await?;
-        info!("Got gsa auth extras {:?}", String::from_utf8_lossy(&resp));
+        // Not the reply: it lists the account's trusted phone numbers, and a refusal other than
+        // the 403 above arrives here too.
+        info!("Got gsa auth extras: HTTP {}, {} bytes", status, resp.len());
         let mut new_state: AuthenticationExtras = serde_json::from_slice(&resp)?;
         if new_state.trusted_phone_numbers.is_empty() {
             return Err(Error::HardwareKeyError);
