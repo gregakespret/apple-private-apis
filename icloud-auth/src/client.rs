@@ -392,8 +392,21 @@ fn sms_send_error(status: u16, body: &str) -> Error {
     }
 }
 
-/// What a failed 2FA request may log about Apple's reply: the status and each `serviceErrors`
-/// entry's code, title and message. Never the reply itself: a rejected security code comes back
+/// The `securityCode` flags with which Apple takes no more codes for the text it sent.
+const SECURITY_CODE_STOP_FLAGS: [&str; 3] = ["tooManyCodesValidated", "securityCodeLocked", "securityCodeCooldown"];
+
+/// The stop flags Apple set in a reply. They are booleans, so naming them logs nothing typed or
+/// account-bound.
+fn security_code_stops(v: &serde_json::Value) -> Vec<&'static str> {
+    let security_code = v.get("securityCode");
+    SECURITY_CODE_STOP_FLAGS.into_iter()
+        .filter(|flag| security_code.and_then(|s| s.get(flag)).and_then(|f| f.as_bool()).unwrap_or(false))
+        .collect()
+}
+
+/// What a failed 2FA request may log about Apple's reply: the status, each `serviceErrors`
+/// entry's code, title and message, and the stop flags that decide whether a wrong code can be
+/// retyped. Never the reply itself: a rejected security code comes back
 /// with the typed code and the account's trusted phone numbers in it.
 fn apple_error_summary(status: u16, body: &str) -> String {
     fn field(error: &serde_json::Value, key: &str) -> String {
@@ -407,7 +420,7 @@ fn apple_error_summary(status: u16, body: &str) -> String {
     }
     let reply = serde_json::from_str::<serde_json::Value>(body).ok();
     let errors: Vec<String> = reply.as_ref()
-        .and_then(|v| v.get("serviceErrors").or(v.get("service_errors"))?.as_array())
+        .and_then(service_errors)
         .into_iter()
         .flatten()
         .map(|e| [field(e, "code"), field(e, "title"), field(e, "message")])
@@ -415,10 +428,14 @@ fn apple_error_summary(status: u16, body: &str) -> String {
         .filter(|parts| parts.iter().any(|part| !part.is_empty()))
         .map(|[code, title, message]| format!("{code} \"{title}\": {message}"))
         .collect();
-    if errors.is_empty() {
+    let summary = if errors.is_empty() {
         format!("HTTP {status}, no Apple error in a {}-byte reply", body.len())
     } else {
         format!("HTTP {status}, Apple error {}", errors.join("; "))
+    };
+    match reply.as_ref().map(security_code_stops) {
+        Some(stops) if !stops.is_empty() => format!("{summary} [{}]", stops.join(", ")),
+        _ => summary,
     }
 }
 
@@ -507,10 +524,7 @@ fn code_can_be_retyped(body: &str) -> bool {
     let wrong_code = service_errors(&v).is_some_and(|errors| {
         !errors.is_empty() && errors.iter().all(|e| e.get("code").and_then(|c| c.as_str()) == Some("-21669"))
     });
-    let security_code = v.get("securityCode");
-    let stop = ["tooManyCodesValidated", "securityCodeLocked", "securityCodeCooldown"].iter()
-        .any(|flag| security_code.and_then(|s| s.get(flag)).and_then(|f| f.as_bool()).unwrap_or(false));
-    wrong_code && !stop
+    wrong_code && security_code_stops(&v).is_empty()
 }
 
 #[cfg(test)]
@@ -618,6 +632,15 @@ mod apple_error_summary_tests {
             let line = apple_error_summary(502, body);
             assert_eq!(line, format!("HTTP 502, no Apple error in a {}-byte reply", body.len()));
         }
+    }
+
+    // A wrong code that cannot be retyped logs the same -21669 as one that can; only the flag
+    // says why the sign-in ended instead of asking again.
+    #[test]
+    fn names_the_flag_that_ended_the_retries() {
+        let body = r#"{"securityCode":{"code":"482913","securityCodeLocked":true,"securityCodeCooldown":false},"serviceErrors":[{"code":"-21669","title":"Incorrect Verification Code","message":"Incorrect verification code."}]}"#;
+        let line = apple_error_summary(400, body);
+        assert_eq!(line, r#"HTTP 400, Apple error -21669 "Incorrect Verification Code": Incorrect verification code. [securityCodeLocked]"#);
     }
 
     // Two sign-ins interleave in one log, and only a record's first line carries its session tag:
